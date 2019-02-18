@@ -14,13 +14,10 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
-	"os/signal"
 	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
-	"syscall"
-	"time"
 )
 
 func errChk(e error) {
@@ -178,14 +175,19 @@ func desktopEnv() string {
 	return env
 }
 
-func getURLPrefix(url string) string {
+func getURLPrefix(url string) (prefix string, date string) {
 	resp, err := http.Get(url)
 	errChk(err)
 	defer resp.Body.Close()
+
 	body, err := ioutil.ReadAll(resp.Body)
 	errChk(err)
-	re := regexp.MustCompile("<urlBase>(.*)</urlBase>")
-	return "http://bing.com" + re.FindStringSubmatch(string(body))[1]
+
+	strBody := string(body)
+	// fmt.Println(strbody)
+	urlBaseRegex := regexp.MustCompile("<urlBase>(.*)</urlBase>")
+	dateRegex := regexp.MustCompile("<startdate>(.*)</startdate>")
+	return "http://bing.com" + urlBaseRegex.FindStringSubmatch(strBody)[1], dateRegex.FindStringSubmatch(strBody)[1]
 }
 
 func imageChk(image string, length int) bool {
@@ -212,12 +214,13 @@ func urlChk(resp *http.Response, uri string) bool {
 // download the highest resolution
 func downloadWallpaper(xml string, dir string) string {
 	file := ""
-	prefix := getURLPrefix(xml)
-	resolutions := []string{"_1920x1200", "_1920x1080", "_1366x768", "_1280x768", "_1280x720", "_1024x768"}
+	prefix, date := getURLPrefix(xml)
+	resolutions := []string{"_3840x2400", "_3840x2160", "_1920x1200", "_1920x1080", "_1366x768", "_1280x768", "_1280x720", "_1024x768"}
 	// create picture diretory if does not already exist
-	if _, err := os.Stat(dir); os.IsNotExist(err) {
-		fmt.Println("creating " + dir)
-		err = os.MkdirAll(dir, 0755)
+	datePath := filepath.Join(dir, date)
+	if _, err := os.Stat(datePath); os.IsNotExist(err) {
+		fmt.Println("creating " + datePath)
+		err = os.MkdirAll(datePath, 0755)
 		errChk(err)
 	}
 
@@ -234,7 +237,7 @@ func downloadWallpaper(xml string, dir string) string {
 
 		// bing will not return 301 for redirect
 		if resp.StatusCode == 200 && urlChk(resp, uri) {
-			file = filepath.Join(dir, filepath.Base(uri))
+			file = filepath.Join(dir, date, filepath.Base(uri))
 			if _, err := os.Stat(file); os.IsNotExist(err) {
 				out, err := os.Create(file)
 				errChk(err)
@@ -433,71 +436,75 @@ func setXfceWallpaper(pic string) {
 }
 
 func main() {
-	var mkt, pic, picOpts, env string
-	var loop bool
+	var mkt, pic, picOpts, env, savePath, idx string
+	// var loop bool
+	// flag.BoolVar(&loop, "loop", false, "whether to loop or not")
+
 	markets := []string{"en-US", "zh-CN", "ja-JP", "en-AU", "en-UK", "de-DE", "fr-FR", "en-NZ", "en-CA"}
-	idx := "0"
+	flag.StringVar(&mkt, "market", "zh-CN", "the region to use. available: "+sliceJoin(markets))
+
+	flag.StringVar(&idx, "index", "0", "Picture offset index, 0 for today, 1 for yesterday and so on")
 	// dir is used to set the location where Bing pictures of the day
 	// are stored. HOME holds the path of the current user's home directory
-	dir := "/home/" + os.Getenv("LOGNAME") + "/Pictures/Bing"
+	defaultDir := "/home/" + os.Getenv("LOGNAME") + "/Pictures/Bing"
+	flag.StringVar(&savePath, "path", defaultDir, "Picture save path")
+
+	flag.StringVar(&env, "env", "", "specify the desktop environment or window manager")
 	// valid options for gnome and cinnamon are: none, wallpaper, centered, scaled, stretched, zoom, spanned
 	// valid options for lxde are: color (that is, disabled), stretch, crop, center, tile, screen
 	// valid options for lxqt are: color (that is, disabled), stretch, crop, center, tile, zoom
-	flag.StringVar(&mkt, "market", "zh-CN", "the region to use. available: "+sliceJoin(markets))
-	flag.BoolVar(&loop, "loop", false, "whether to loop or not")
 	flag.StringVar(&picOpts, "picopts", "zoom", "picture options")
-	flag.StringVar(&env, "env", "", "specify the desktop environment or window manager")
 	flag.Parse()
 
 	if !sliceContains(markets, mkt) {
 		panic("market must be one of the following: " + sliceJoin(markets))
 	}
 
-	if len(env) == 0 {
-		env = desktopEnv()
-	}
-
-	fmt.Println("started bing-wallpaper")
-	dbusChk()
+	// fmt.Println("started bing-wallpaper")
 
 	xml := "http://www.bing.com/HPImageArchive.aspx?format=xml&idx=" + idx + "&n=1&mkt=" + mkt
 
-	if len(env) != 0 {
-		pic = downloadWallpaper(xml, dir)
-		setWallpaper(env, pic, picOpts)
-		fmt.Println("the picture location:" + pic)
-	}
+	pic = downloadWallpaper(xml, savePath)
+	fmt.Println("the picture location:" + pic)
 
-	ticker := time.NewTicker(time.Hour * 1)
+	// dbusChk()
+	// if len(env) == 0 {
+	// 	env = desktopEnv()
+	// }
+	// if len(env) != 0 {
+	// setWallpaper(env, pic, picOpts)
+	// }
 
-	if loop {
-		for range ticker.C {
-			// there's a racing problem between bing-wallpaper and the desktop.
-			// if bing-wallpaper was started before the desktop by systemd, we'll fail to get any desktop information
-			// so we try an hour later, if the destkop variable is still null, then we treat it as WM
-			env = desktopEnv()
-			if len(env) == 0 {
-				env = "WM"
-			}
-			newPic := downloadWallpaper(xml, dir)
-			if newPic != pic {
-				setWallpaper(env, newPic, picOpts)
-				fmt.Println("the new picture:" + newPic)
-			}
-		}
-	}
+	// ticker := time.NewTicker(time.Hour * 1)
 
-	sigs := make(chan os.Signal, 1)
-	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
+	// if loop {
+	// 	for range ticker.C {
+	// 		// there's a racing problem between bing-wallpaper and the desktop.
+	// 		// if bing-wallpaper was started before the desktop by systemd, we'll fail to get any desktop information
+	// 		// so we try an hour later, if the destkop variable is still null, then we treat it as WM
+	// 		env = desktopEnv()
+	// 		if len(env) == 0 {
+	// 			env = "WM"
+	// 		}
+	// 		newPic := downloadWallpaper(xml, savePath)
+	// 		if newPic != pic {
+	// 			// setWallpaper(env, newPic, picOpts)
+	// 			fmt.Println("the new picture:" + newPic)
+	// 		}
+	// 	}
+	// }
 
-	go func() {
-		sig := <-sigs
-		fmt.Println("received signal:")
-		fmt.Println(sig)
-		fmt.Println("quiting...")
-		ticker.Stop()
-		os.Exit(0)
-	}()
+	// sigs := make(chan os.Signal, 1)
+	// signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
 
-	ticker.Stop() // memory leak
+	// go func() {
+	// 	sig := <-sigs
+	// 	fmt.Println("received signal:")
+	// 	fmt.Println(sig)
+	// 	fmt.Println("quiting...")
+	// 	ticker.Stop()
+	// 	os.Exit(0)
+	// }()
+
+	// ticker.Stop() // memory leak
 }
